@@ -1,1 +1,2 @@
 cadquery-ocp-novtk>=7.8
+numpy>=1.24

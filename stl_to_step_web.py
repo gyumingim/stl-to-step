@@ -41,12 +41,14 @@ PAGE = r"""<!DOCTYPE html>
 <div id="drop">여기에 STL 파일을 끌어다 놓거나 <b>클릭해서 고르기</b> (여러 개 가능)
  <input id="file" type="file" accept=".stl" multiple hidden></div>
 <div class="opts">
+ <label><input id="circ" type="checkbox" checked> 원·원통 복원</label>
  <label><input id="merge" type="checkbox" checked> 같은 평면 면 합치기</label>
  <label>꿰매기 오차 <input id="tol" type="number" value="0.01" step="0.001" min="0.0001"> mm</label>
 </div>
 <table id="tbl" hidden><thead><tr><th>파일</th><th>상태</th><th>결과</th><th></th></tr></thead><tbody></tbody></table>
 <div class="note">
- · 곡면은 매끈한 곡면이 아니라 삼각형 조각 그대로 들어갑니다.<br>
+ · <b>원·원통 복원</b>: 구멍·보스·필렛·긴 구멍을 진짜 원통면(원 모서리)으로 바꿉니다. 안 되면 예전처럼 삼각형으로 저장합니다.<br>
+ · 구·원뿔·자유곡면은 여전히 삼각형 조각입니다.<br>
  · 삼각형 20만 개가 넘는 큰 파일은 수십 분 걸릴 수 있습니다 (먼저 메시를 줄이기 권장).<br>
  · 파일은 한 번에 하나씩 차례로 처리됩니다.
 </div>
@@ -71,13 +73,16 @@ async function run(files){
     c[1].textContent='변환 중…'; const t0=Date.now();
     const timer=setInterval(()=>c[1].textContent=`변환 중… ${((Date.now()-t0)/1000).toFixed(0)} s`,1000);
     try{
-      const q=`?name=${encodeURIComponent(f.name)}&tol=${document.getElementById('tol').value}&merge=${document.getElementById('merge').checked?1:0}`;
+      const q=`?name=${encodeURIComponent(f.name)}&tol=${document.getElementById('tol').value}&merge=${document.getElementById('merge').checked?1:0}&circles=${document.getElementById('circ').checked?1:0}`;
       const r=await fetch('/convert'+q,{method:'POST',body:f});
       const j=await r.json(); clearInterval(timer);
       if(!r.ok) throw new Error(j.error||r.status);
       const w=[]; if(j.open) w.push(`열린 껍질 ${j.open}개`); if(!j.valid) w.push('형상 검사 불통과');
       c[1].innerHTML=w.length?`<span class=warn>완료 (경고: ${w.join(', ')})</span>`:'<span class=ok>완료</span>';
-      c[2].textContent=`삼각형 ${j.tri.toLocaleString()} → 면 ${j.faces.toLocaleString()} · 덩어리 ${j.bodies} · ${j.vol.toFixed(1)} cm³ · ${j.sec.toFixed(1)} s`;
+      let circ='';
+      if(j.circles==='ok') circ=` · <b>원통면 ${j.cyl}개</b> (지름 ${j.diameters.slice(0,10).join(', ')}${j.diameters.length>10?' …':''})`;
+      else if(j.circles==='fallback') circ=` · <span class=warn>원 복원 안 함: ${j.note}</span>`;
+      c[2].innerHTML=`삼각형 ${j.tri.toLocaleString()} → 면 ${j.faces.toLocaleString()} · 덩어리 ${j.bodies} · ${j.vol.toFixed(1)} cm³ · ${j.sec.toFixed(1)} s`+circ;
       c[3].innerHTML=`<a class=btn href="/download/${j.id}" download="${j.out}">STEP 받기</a>`;
     }catch(e){clearInterval(timer);c[1].innerHTML=`<span class=err>실패: ${e.message}</span>`}
   }
@@ -126,6 +131,7 @@ class H(BaseHTTPRequestHandler):
         name = os.path.basename(q.get("name", ["part.stl"])[0])
         tol = float(q.get("tol", ["0.01"])[0])
         merge = q.get("merge", ["1"])[0] == "1"
+        circles = q.get("circles", ["1"])[0] == "1"
         rid = os.urandom(8).hex()
         src = os.path.join(OUTDIR, rid + ".stl")
         dst = os.path.join(OUTDIR, rid + ".step")
@@ -139,7 +145,7 @@ class H(BaseHTTPRequestHandler):
                 left -= len(chunk)
         try:
             with LOCK:
-                r = convert(src, dst, tol, merge)
+                r = convert(src, dst, tol, merge, circles)
         except Exception as e:
             return self._send(500, {"error": str(e)})
         finally:
@@ -147,7 +153,7 @@ class H(BaseHTTPRequestHandler):
         out = os.path.splitext(name)[0] + ".step"
         RESULTS[rid] = (dst, out)
         r.update(id=rid, out=out)
-        print(f"변환: {name} -> 면 {r['faces']} ({r['sec']:.1f}s)", flush=True)
+        print(f"변환: {name} -> 면 {r['faces']}, 원통면 {r['cyl']} ({r['sec']:.1f}s)", flush=True)
         self._send(200, r)
 
     def log_message(self, *a):
