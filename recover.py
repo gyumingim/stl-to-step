@@ -160,6 +160,16 @@ class Mesh:
         ob = fb[np.arange(len(fb)), np.argmax(mask, 1)]
         dist = np.abs(np.einsum("ij,ij->i", V[ob] - V[F[ta, 0]], N[ta]))
         same &= dist < self.ptol
+        # 바늘 삼각형(높이가 아주 작음)은 법선이 흔들림 -> 성한 쪽 평면에서 거리만 봄
+        L3 = np.stack([np.linalg.norm(V[F[:, k]] - V[F[:, (k + 1) % 3]], axis=1) for k in range(3)], 1)
+        hgt = 2 * self.area / np.maximum(L3.max(1), 1e-30)
+        sl = hgt < 20 * self.ptol
+        fa = F[ta]
+        mask_a = (fa != self.ev[:, [0]]) & (fa != self.ev[:, [1]])
+        oa = fa[np.arange(len(fa)), np.argmax(mask_a, 1)]
+        d_b = np.abs(np.einsum("ij,ij->i", V[ob] - V[F[ta, 0]], N[ta]))   # b 의 점 -> a 평면
+        d_a = np.abs(np.einsum("ij,ij->i", V[oa] - V[F[tb, 0]], N[tb]))   # a 의 점 -> b 평면
+        same |= (sl[tb] & ~sl[ta] & (d_b < self.ptol)) | (sl[ta] & ~sl[tb] & (d_a < self.ptol))
         pid = _components(len(F), ta[same], tb[same])
         # 평면성 검사: 조각별 평면 맞춤 후 최대 거리
         P = pid.max() + 1
@@ -203,6 +213,245 @@ class Mesh:
 
     # -- 원통 찾기
     def cylinders(self):
+        cyls = self._strip_cylinders()
+        taken = set()
+        for c in cyls:
+            taken |= c["patches"]
+        return cyls + self._free_cylinders(taken)
+
+    def _free_cylinders(self, taken):
+        """띠가 아닌 원통: 위·아래 고리 꼭짓점이 엇갈려(반 마디 돌아가) 삼각형 하나하나가 따로 노는 메시
+        (Fusion 360 등). 매끈하게 이어진 작은 조각(삼각형 1~2개) 덩어리마다 법선 공분산으로 축을 잡고
+        꼭짓점을 축에 수직인 평면에 투영해 원 맞춤. 같은 엄격한 기준(오차, 마디 각, 활꼴 높이)으로 받음."""
+        F, V, N = self.F, self.V, self.N
+        small = (self.ptri_count[self.pid] <= 2) & ~np.isin(self.pid, list(taken))
+        ta, tb = self.et[:, 0], self.et[:, 1]
+        dih = np.arccos(np.clip(np.einsum("ij,ij->i", N[ta], N[tb]), -1, 1))
+        j = small[ta] & small[tb] & (self.pid[ta] != self.pid[tb]) & (dih <= THETA_MAX + 1e-6)
+        if not j.any():
+            return []
+        comp = _components(len(F), ta[j], tb[j])
+        tris_all = np.nonzero(small)[0]
+        cc = comp[tris_all]
+        order = np.argsort(cc, kind="stable")
+        tris_all, cc = tris_all[order], cc[order]
+        cut = np.flatnonzero(np.diff(cc)) + 1
+        out = []
+        tol = self.fit_tol
+        for tris in np.split(tris_all, cut):
+            if len(tris) < 2 * MIN_CHORDS:
+                continue
+            n, w = N[tris], self.area[tris]
+            M = (n * w[:, None]).T @ n
+            ev, evec = np.linalg.eigh(M)
+            d = evec[:, 0]
+            if ev[1] < 1e-6 * ev.sum():
+                continue
+            d = self._ring_axis(tris, d)
+            if np.abs(n @ d).max() > math.sin(math.radians(2)):
+                out += self._zigzag_arcs(tris, d)
+                continue
+            e1, e2 = _basis(d)
+            vs = np.unique(F[tris])
+            Y = np.c_[V[vs] @ e1, V[vs] @ e2]
+            c2, r, err = fit_circle(Y)
+            if err >= tol or r > self.diag:
+                # 원 하나가 아님: 원호 + 접하는 평면이 섞인 띠 -> 지그재그 순서로 꿰어 원호/직선으로 나눔
+                out += self._zigzag_arcs(tris, d)
+                continue
+            ang = np.unique(np.round(np.arctan2(Y[:, 1] - c2[1], Y[:, 0] - c2[0]), 9))
+            if len(ang) < MIN_CHORDS + 1:
+                continue
+            gaps = np.diff(np.r_[ang, ang[0] + 2 * math.pi])
+            big = gaps > THETA_MAX + 1e-6
+            if big.sum() > 1:
+                continue              # 마디가 너무 넓거나 띄엄띄엄
+            if big.sum() == 1:        # 부분 원호: 활꼴 높이 검사
+                span = 2 * math.pi - gaps[big][0]
+                if span < math.pi and r * (1 - math.cos(span / 2)) < 3 * tol:
+                    continue
+            # 법선이 모두 같은 쪽(바깥 또는 안쪽)을 봐야 함
+            cen = V[F[tris]].mean(1)
+            rad = np.c_[cen @ e1, cen @ e2] - c2
+            sgn = np.einsum("ij,ij->i", rad, np.c_[n @ e1, n @ e2])
+            if not ((sgn > 0).all() or (sgn < 0).all()):
+                continue
+            if not self._two_rings_ok(tris, d, e1, e2, c2):
+                continue
+            p = c2[0] * e1 + c2[1] * e2
+            out.append(dict(c2=c2, r=r, d=d, e1=e1, e2=e2, p=p,
+                            patches=set(self.pid[tris].tolist())))
+        return out
+
+    def _two_rings_ok(self, tris, d, e1, e2, c2):
+        """엇갈린 고리 원통의 모양 조건: 꼭짓점이 축에 수직인 고리 두 개(높이 두 층)에만 있고,
+        삼각형마다 두 고리를 잇고, 고리마다 꼭짓점이 4 개 이상 같은 각도 간격(2 %, 양 끝은 같거나 좁음).
+        자유곡면·구·굽은 관의 삼각형 덩어리는 높이 층이 많아서 여기서 걸러짐."""
+        F, V = self.F, self.V
+        vs = np.unique(F[tris])
+        h = V[vs] @ d
+        o = np.sort(h)
+        cut = o[1:][np.diff(o) > max(5 * self.fit_tol, 0.05)]
+        if len(cut) != 1:
+            return False
+        lv = dict(zip(vs.tolist(), (h >= cut[0]).tolist()))
+        for t in tris:
+            k = {lv[v] for v in F[t].tolist()}
+            if len(k) != 2:
+                return False
+        for top in (False, True):
+            R = V[[v for v in vs.tolist() if lv[v] == top]]
+            if len(R) < 4:
+                return False
+            if np.ptp(R @ d) > max(self.fit_tol, self.ptol):
+                return False
+            a = np.sort(np.arctan2(R @ e2 - c2[1], R @ e1 - c2[0]))
+            g = np.diff(np.r_[a, a[0] + 2 * math.pi])
+            # 가장 큰 틈 하나는 부분 원호의 빈 곳일 수 있음
+            if g.max() > THETA_MAX + 1e-6:
+                k = int(np.argmax(g))
+                g = np.r_[g[k + 1:], g[:k]]
+            inner = g[1:-1] if len(g) > 2 else g
+            if inner.max() > 1.02 * inner.min() or g.max() > 1.02 * inner.max():
+                return False
+        return True
+
+    def _ring_axis(self, tris, d):
+        """법선으로 잡은 축을 고리 평면의 법선으로 다듬음 (엇갈린 삼각형은 법선이 조금 기울어 있음)."""
+        vs = np.unique(self.F[tris])
+        X = self.V[vs]
+        h = X @ d
+        o = np.argsort(h)
+        cut = np.flatnonzero(np.diff(h[o]) > 0.25 * max(np.ptp(h), 1e-9)) + 1
+        best = None
+        for grp in np.split(o, cut):
+            if len(grp) >= 3:
+                P = X[grp] - X[grp].mean(0)
+                _, sv, vt = np.linalg.svd(P, full_matrices=False)
+                if sv[1] > 10 * self.ptol and abs(P @ vt[2]).max() < self.ptol:
+                    if best is None or len(grp) > best[0]:
+                        best = (len(grp), vt[2])
+        if best is None:
+            return d
+        n = best[1] * np.sign(best[1] @ d)
+        return n if n @ d > math.cos(math.radians(2)) else d
+
+    def _zigzag_arcs(self, tris, d):
+        """엇갈린 고리 띠: 삼각형 k = (p_k, p_k+1, p_k+2) 로 이어진 지그재그. 점 p 를 축 방향으로
+        투영한 2D 꺾은선을 띠 방식과 같은 규칙(_segment)으로 원호/직선으로 나눈다."""
+        F, N = self.F, self.N
+        keep = tris[np.abs(N[tris] @ d) < math.sin(math.radians(2))]
+        if len(keep) < 2 * MIN_CHORDS:
+            return []
+        ks = set(keep.tolist())
+        nb = {t: [] for t in ks}
+        ta, tb = self.et[:, 0], self.et[:, 1]
+        m = np.isin(ta, keep) & np.isin(tb, keep)
+        for a, b in zip(ta[m].tolist(), tb[m].tolist()):
+            nb[a].append(b)
+            nb[b].append(a)
+        if any(len(v) > 2 for v in nb.values()):
+            return []
+        e1, e2 = _basis(d)
+        seen, res = set(), []
+        for t0 in ks:
+            if t0 in seen or len(nb[t0]) == 2:
+                continue
+            res += self._zz_walk(t0, nb, seen, False, d, e1, e2)
+        for t0 in ks:
+            if t0 not in seen:
+                res += self._zz_walk(t0, nb, seen, True, d, e1, e2)
+        return res
+
+    def _zz_walk(self, t0, nb, seen, closed, d, e1, e2):
+        F = self.F
+        seq, prev, cur = [], None, t0
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            seq.append(cur)
+            nxt = [q for q in nb[cur] if q != prev and q not in seen]
+            prev, cur = cur, (nxt[0] if nxt else None)
+        m = len(seq)
+        if m < 2 * MIN_CHORDS:
+            return []
+        # 점 순서 = 그 점을 가진 삼각형 번호의 평균 (지그재그·부채꼴 모두), 그 뒤 이웃 맞바꿈으로 다듬음
+        pos = {}
+        for k, t in enumerate(seq):
+            for v in F[t].tolist():
+                pos.setdefault(v, []).append(k)
+        if closed:  # 고리: 시작 근처 점이 양 끝에 갈라지지 않게 원형 평균
+            ang = {v: math.atan2(np.mean(np.sin(np.array(ks) * 2 * math.pi / m)),
+                                 np.mean(np.cos(np.array(ks) * 2 * math.pi / m))) for v, ks in pos.items()}
+            pts = sorted(pos, key=lambda v: ang[v])
+        else:
+            pts = sorted(pos, key=lambda v: np.mean(pos[v]))
+        X0 = self.V[pts]
+        Y0 = np.c_[X0 @ e1, X0 @ e2]
+        keepi = [0]
+        for q in range(1, len(pts)):  # 위·아래 꼭짓점이 같은 각도면 2D 로 한 점
+            if np.linalg.norm(Y0[q] - Y0[keepi[-1]]) > self.ptol:
+                keepi.append(q)
+        pts = [pts[q] for q in keepi]
+        Y = Y0[keepi]
+        for _ in range(3):
+            changed = False
+            for q in range(1, len(pts) - 2):
+                a, b, c, e = Y[q - 1], Y[q], Y[q + 1], Y[q + 2]
+                now = np.linalg.norm(b - a) + np.linalg.norm(e - c)
+                sw = np.linalg.norm(c - a) + np.linalg.norm(e - b)
+                if sw < now - 1e-12:
+                    Y[[q, q + 1]] = Y[[q + 1, q]]
+                    pts[q], pts[q + 1] = pts[q + 1], pts[q]
+                    changed = True
+            if not changed:
+                break
+        if closed and np.linalg.norm(Y[0] - Y[-1]) <= self.ptol:
+            pts, Y = pts[:-1], Y[:-1]
+        rank = {v: q for q, v in enumerate(pts)}
+        X = self.V[pts]
+        Q = np.c_[X @ e1, X @ e2]
+        if (np.linalg.norm(np.diff(Q, axis=0), axis=1) <= self.ptol).any():
+            return []
+        out = []
+        n = len(pts)
+        tri_r = []  # 삼각형마다 꼭짓점 순위 (같은 2D 점으로 합쳐진 꼭짓점은 가까운 순위로)
+        for t in seq:
+            rs = []
+            for v in F[t].tolist():
+                if v in rank:
+                    rs.append(rank[v])
+                else:
+                    y = np.array([self.V[v] @ e1, self.V[v] @ e2])
+                    rs.append(int(np.argmin(np.linalg.norm(Q - y, axis=1))))
+            tri_r.append(rs)
+        h = X @ d
+        hs = np.sort(h)  # 축 방향 높이로 고리 나누기 (틈 > 0.05 mm)
+        edges = hs[1:][np.diff(hs) > max(5 * self.fit_tol, 0.05)]
+        groups = np.searchsorted(edges, h, side="right")
+        for i, j, c2, r in self._segment(Q, closed, groups):
+            full = closed and j - i >= n
+            sel = []
+            for t, rs in zip(seq, tri_r):
+                if full:
+                    sel.append(t)
+                    continue
+                ok = True
+                for x in rs:
+                    if closed:
+                        x = (x - i) % n + i
+                    if not (i <= x <= j):
+                        ok = False
+                if ok:
+                    sel.append(t)
+            if len(sel) < MIN_CHORDS - 1:
+                continue
+            if not self._two_rings_ok(np.array(sel), d, e1, e2, c2):
+                continue
+            out.append(dict(c2=c2, r=r, d=d, e1=e1, e2=e2, p=c2[0] * e1 + c2[1] * e2,
+                            patches=set(self.pid[sel].tolist())))
+        return out
+
+    def _strip_cylinders(self):
         V, pid = self.V, self.pid
         pa, pb = pid[self.et[:, 0]], pid[self.et[:, 1]]
         inter = pa != pb
@@ -340,7 +589,7 @@ class Mesh:
                 res.append(dict(c2=c, r=r, d=d, e1=e1, e2=e2, patches=set(patches)))
         return res
 
-    def _segment(self, Q, closed):
+    def _segment(self, Q, closed, groups=None):
         """2D 꺾은선을 원호로 나눔 -> [(i, j, center, r)] (마디 i..j-1)."""
         tol = self.fit_tol
         n = len(Q)
@@ -353,9 +602,10 @@ class Mesh:
             seg = np.linalg.norm(np.roll(Q, -1, 0) - Q, axis=1)
             s = int(np.argmax(seg))
             Qe = np.vstack([Q[s:], Q[:s], Q[s:s + 1]])
-            arcs = self._greedy(Qe)
+            ge = None if groups is None else np.r_[groups[s:], groups[:s], groups[s:s + 1]]
+            arcs = self._greedy(Qe, ge)
             return [(i + s, j + s, c, r) for i, j, c, r in arcs]
-        return self._greedy(Q)
+        return self._greedy(Q, groups)
 
     def _sag_ok(self, P, r):
         """원호 전체의 활꼴 높이가 맞춤 오차의 3배 이상이어야 곡률이 믿을 만함."""
@@ -382,7 +632,7 @@ class Mesh:
         expect = half[:-1] + half[1:]
         return bool((np.abs(turn - expect) <= np.maximum(math.radians(0.05), 0.1 * expect)).all())
 
-    def _greedy(self, Q):
+    def _greedy(self, Q, groups=None):
         tol, n = self.fit_tol, len(Q)
         arcs, i = [], 0
         while i + MIN_CHORDS < n:
@@ -412,22 +662,27 @@ class Mesh:
         # 스플라인 윤곽·날개 단면 같은 자유곡선은 마디 길이가 들쭉날쭉해서 여기서 걸러짐.
         seg = np.linalg.norm(np.diff(Q, axis=0), axis=1)
         out = []
-        for a in merged:
-            sg = seg[a[0]:a[1]]
+        def uniform(sg):
             inner = sg[1:-1] if len(sg) > 2 else sg
-            if inner.max() > 1.02 * inner.min() or sg.max() > 1.02 * inner.max():
-                continue
+            return not (inner.max() > 1.02 * inner.min() or sg.max() > 1.02 * inner.max())
+        for a in merged:
+            if groups is None:
+                if not uniform(seg[a[0]:a[1]]):
+                    continue
+            else:
+                # 엇갈린 고리: 위·아래 고리마다 따로 균일해야 함 (두 고리의 마디 수가 달라도 됨)
+                P, g = Q[a[0]:a[1] + 1], groups[a[0]:a[1] + 1]
+                ok, tested = True, False
+                for lab in np.unique(g):
+                    R = P[g == lab]
+                    if len(R) >= 4:
+                        tested = True
+                        ok &= uniform(np.linalg.norm(np.diff(R, axis=0), axis=1))
+                if not (ok and tested):
+                    continue
             out.append(a)
-        # 사이에 직선 없이 맞붙은 원호가 서로 다른 원이면 자유곡선으로 보고 버림
-        res = []
-        for k, a in enumerate(out):
-            bad = False
-            for b in (out[k - 1] if k else None, out[k + 1] if k + 1 < len(out) else None):
-                if b is not None and (b[1] == a[0] or a[1] == b[0]):
-                    bad = True  # 같은 원이면 위에서 이미 합쳐졌음
-            if not bad:
-                res.append(a)
-        return res
+        # (맞붙은 다른 원호는 받음: 반지름이 다른 필렛이 이어진 윤곽은 CAD 에 흔함. 자유곡선은 위 균일성에서 걸림)
+        return out
 
     def _narrow_smooth(self, c, axp):
         """축 방향으로 좁고(길이 < 마디 폭 x3) 끝이 다른 곡면과 매끈하게 이어지면 가짜 원통
@@ -665,6 +920,7 @@ class Builder:
             for e in inc[v]:
                 if not used[e]:
                     chains.append((keys[e], walk(v, e)))
+        self.true_corner = set(corner)
         for e in range(len(ev)):
             if not used[e]:
                 v0 = int(ev[e][0])
@@ -729,6 +985,10 @@ class Builder:
             w0 = q0 - ctr
             t0 = math.atan2(w0 @ ya / R2, w0 @ xa / R1)
             Vx = BRepBuilderAPI_MakeVertex(_pnt(q0)).Vertex()
+            if verts[0] in self.true_corner:
+                # 고리가 다른 경계와 한 점에서 만남 -> 그 메시 꼭짓점을 모서리 꼭짓점으로 (와이어가 이어지게)
+                Vx = self._vertex(verts[0])
+                t0 = float(t[0])
             mk = BRepBuilderAPI_MakeEdge(geo, Vx, Vx, t0, t0 + 2 * math.pi)
             return (mk.Edge(), bool(t[-1] < t[0])) if mk.IsDone() else None
         t0, t1 = float(t[0]), float(t[-1])
@@ -782,6 +1042,21 @@ class Builder:
     def _faces(self):
         self.vmap = {}
         self.n_conic = self.n_poly = 0
+        # 고리가 다른 경계와 한 꼭짓점에서 만나면 원통 이음선(u=0)을 그 꼭짓점에 둔다
+        # (아니면 ShapeFix 가 원통 쪽 원만 이음선에서 쪼개 평면 쪽 원과 안 맞음)
+        moved = set()
+        for key, verts, e in self.chains:
+            if verts[0] != verts[-1] or verts[0] not in self.true_corner:
+                continue
+            for lab in key:
+                if lab >= 0 and self.surf[lab][0] == "cyl" and self.surf[lab][1] not in moved:
+                    c = self.cyls[self.surf[lab][1]]
+                    w = self.X[verts[0]] - c["p"]
+                    w = w - (w @ c["d"]) * c["d"]
+                    if np.linalg.norm(w) > 0:
+                        c["e1"] = w / np.linalg.norm(w)
+                        c["e2"] = np.cross(c["d"], c["e1"])
+                        moved.add(self.surf[lab][1])
         reg_chains = [[] for _ in range(self.nreg)]
         m = self.m
         for key, verts, e in self.chains:
@@ -838,7 +1113,7 @@ class Builder:
                 want_rev = rv if fwd else (not rv)
                 seq.append(e.Reversed() if want_rev else e)
             s0, s1 = (a, b) if fwd else (b, a)
-            if s0 == s1:
+            if s0 == s1 and s0 not in self.true_corner:
                 w = TopoDS_Wire()
                 bld.MakeWire(w)
                 for e in seq:
@@ -850,7 +1125,7 @@ class Builder:
         for i, (s0, _, _) in enumerate(darts):
             out_of.setdefault(s0, []).append(i)
         used = [False] * len(darts)
-        for s in range(len(darts)):
+        for s in sorted(range(len(darts)), key=lambda q: darts[q][0] == darts[q][1]):
             if used[s]:
                 continue
             w = TopoDS_Wire()
@@ -861,9 +1136,10 @@ class Builder:
                 for e in darts[i][2]:
                     bld.Add(w, e)
                 cur = darts[i][1]
-                if cur == start:
-                    break
                 nxt = [j for j in out_of.get(cur, []) if not used[j]]
+                if cur == start and not any(darts[j][1] == cur for j in nxt):
+                    break
+                nxt.sort(key=lambda j: darts[j][1] != cur)  # 한 점에 매달린 고리를 먼저 돌고 계속
                 guard += 1
                 if not nxt or guard > len(darts):
                     return None
