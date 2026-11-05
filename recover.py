@@ -27,7 +27,7 @@ from OCP.BRepGProp import BRepGProp
 from OCP.Geom import Geom_Circle, Geom_CylindricalSurface, Geom_Ellipse, Geom_Plane
 from OCP.GProp import GProp_GProps
 from OCP.gp import gp_Ax2, gp_Ax3, gp_Circ, gp_Dir, gp_Elips, gp_Pln, gp_Pnt
-from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shell, ShapeFix_Solid
+from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Solid
 from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
 from OCP.StlAPI import StlAPI_Reader
 from OCP.TopAbs import TopAbs_SHELL
@@ -887,10 +887,7 @@ def _shells_to_solids(sewn):
     solids, open_shells = [], 0
     ex = TopExp_Explorer(sewn, TopAbs_SHELL)
     while ex.More():
-        shell = TopoDS.Shell_s(ex.Current())
-        fs = ShapeFix_Shell(shell)
-        fs.Perform()
-        shell = fs.Shell()
+        shell = TopoDS.Shell_s(ex.Current())  # 면 방향은 메시에서 맞춰 둠 (ShapeFix_Shell 은 큰 메시에서 느림)
         if shell.Closed():
             mk = BRepBuilderAPI_MakeSolid(shell)
             fix = ShapeFix_Solid(mk.Solid())
